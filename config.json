@@ -1,0 +1,6 @@
+{
+    "pollInterval": 100,
+    "ipPort" : 3000,
+    "timeout": 5000,
+    "maxNodes" : 5
+}
