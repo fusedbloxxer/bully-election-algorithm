@@ -4,51 +4,54 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"log"
-	"net"
-	"sync"
-	"time"
-
 	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/viper"
+	"log"
+	"net"
+	"os"
+	"sync"
+	"time"
 )
 
 type MessageType string
 
 const (
 	Election MessageType = "ELECTION"
-	Alive    MessageType = "OK"
 	Win      MessageType = "WIN"
+	Alive    MessageType = "OK"
+	Ack      MessageType = "ACK"
 )
 
 type Message struct {
-	Message  MessageType `json:"Message"`
+	Content  MessageType `json:"Content"`
 	SenderId int         `json:"SenderId"`
 }
 
 type BullyNode struct {
-	currentId int
-	leaderId  int
-	idToIpMap map[int]string
-	Mu        sync.Mutex
+	currentId   int
+	leaderId    int
+	idToAddress map[int]string
+	Mu          sync.Mutex
 }
 
 var node = BullyNode{}
 
 // variabila care ne spune daca nodul curent a dat deja mai departe un mesaj de electie
-var electionAlreadySentHigher bool = false
+var electionAlreadySentHigher = false
 
 // variabila care ne spune daca nodul curent stie ca altul mai mare este in viata
 var higherNodeIsAlive = false
 
-// functie apelata atunci cand un nod de rang mai mic trimite mesaj de electie catre nodul curent
-func respondToSmallerNode(connection net.Conn) error {
+// variabila care ne spune daca a primit mesaj de win
+var hasReceivedWin = false
 
-	fmt.Println(" == Sending OK to: ", connection.LocalAddr())
+// functie apelata atunci cand un nod de rang mai mic trimite mesaj de electie catre nodul curent
+func respondToSmallerNode(connection net.Conn, message Message) error {
+	fmt.Println(" == Sending OK to: ", message.SenderId)
 
 	var messageObj = Message{
-		Message:  "OK",
 		SenderId: node.currentId,
+		Content:  Alive,
 	}
 
 	messageInBytes, err := json.Marshal(&messageObj)
@@ -57,19 +60,21 @@ func respondToSmallerNode(connection net.Conn) error {
 		return err
 	}
 
-	fmt.Fprintf(connection, "%s\n", string(messageInBytes))
+	if _, err = fmt.Fprintf(connection, "%s\n", messageInBytes); err != nil {
+		return fmt.Errorf(" != Could not send ALIVE message to %d: %w", message.SenderId, err)
+	}
 
 	return nil
 
 }
 
 // functie apelata atunci cand dorim sa trimitem mesajul de electie catre un nod de rang mai mare
-func startElectionToConnection(connection net.Conn) error {
+func startElectionToConnection(connection net.Conn, sendToId int) error {
 
-	fmt.Println(" == Sending ELECTION to: ", connection.LocalAddr())
+	fmt.Println(" == Sending ELECTION to: ", sendToId)
 
 	messageObj := Message{
-		Message:  "ELECTION",
+		Content:  "ELECTION",
 		SenderId: node.currentId,
 	}
 
@@ -84,12 +89,12 @@ func startElectionToConnection(connection net.Conn) error {
 }
 
 // functie apelata atunci cand nodul curent vrea sa transmita ca el este noul lider
-func sendCoordinatorMessage(connection net.Conn) error {
+func sendCoordinatorMessage(connection net.Conn, sendToId int) error {
 
-	fmt.Println(" == Sending WIN to: ", connection.LocalAddr())
+	fmt.Println(" == Sending WIN to: ", sendToId)
 
 	messageObj := Message{
-		Message:  "WIN",
+		Content:  "WIN",
 		SenderId: node.currentId,
 	}
 
@@ -100,6 +105,9 @@ func sendCoordinatorMessage(connection net.Conn) error {
 	}
 
 	fmt.Fprintf(connection, "%s\n", string(messageInBytes))
+
+	connection.Close()
+
 	return nil
 }
 
@@ -114,7 +122,7 @@ func ReceiveCoordinatorMessage(message Message) {
 func sendWinBroadcast(errorChannel chan error) {
 	fmt.Printf(" == Sending WIN Broadcast...\n")
 	node.leaderId = node.currentId
-	for id, ip := range node.idToIpMap {
+	for id, ip := range node.idToAddress {
 		if id != node.currentId {
 			fmt.Printf(" == Send WIN to %v at %v\n", id, ip)
 			con, err := net.Dial("tcp", ip)
@@ -124,7 +132,7 @@ func sendWinBroadcast(errorChannel chan error) {
 				continue
 			}
 
-			if err = sendCoordinatorMessage(con); err != nil {
+			if err = sendCoordinatorMessage(con, id); err != nil {
 				errorChannel <- fmt.Errorf(" != Could not send election to %v: %w", id, err)
 				continue
 			}
@@ -133,6 +141,7 @@ func sendWinBroadcast(errorChannel chan error) {
 }
 
 func handleRequest(conn net.Conn, errorChannel chan error) {
+	defer conn.Close()
 	raw, err := bufio.NewReader(conn).ReadString('\n')
 
 	if err != nil {
@@ -146,8 +155,7 @@ func handleRequest(conn net.Conn, errorChannel chan error) {
 		return
 	}
 
-	fmt.Println(" == Message received from ", message.SenderId)
-
+	fmt.Println(" == Content received from ", message.SenderId)
 	handleReceivedMessage(conn, message, errorChannel)
 }
 
@@ -158,13 +166,13 @@ func handleReceivedMessage(
 	recv Message,
 	errorChannel chan error,
 ) {
-	switch recv.Message {
+	switch recv.Content {
 	case Election:
 		if recv.SenderId >= node.currentId {
 			log.Fatalf(" != A smaller node cannot receive election messages from higher nodes")
 		}
 		// trimite mesaj alive nodului mai mic care incearca electia
-		if err := respondToSmallerNode(conn); err != nil {
+		if err := respondToSmallerNode(conn, recv); err != nil {
 			errorChannel <- fmt.Errorf(" != Could not respond to smaller node: %v: %w", recv.SenderId, err)
 		}
 	case Win:
@@ -173,27 +181,55 @@ func handleReceivedMessage(
 	case Alive:
 		// asteapta o vreme win-ul.
 		// daca nu primeste, incepe el electia
+		fmt.Printf(" == Wait for WIN message\n")
+
+		now := time.Now()
+		pollInterval := time.Duration(viper.GetInt("pollInterval")) * time.Millisecond
+		ticker := time.NewTicker(pollInterval)
+
+		for t := range ticker.C {
+			timeElapsed := t.Sub(now)
+
+			fmt.Printf(" == Current elapsed: %v\n", timeElapsed)
+			if timeElapsed > time.Duration(viper.GetInt("timeout"))*time.Millisecond {
+				fmt.Printf(" == No one answered\n")
+				break
+			}
+
+			node.Mu.Lock()
+			if higherNodeIsAlive {
+				ticker.Stop()
+				node.Mu.Unlock()
+				break
+			}
+			node.Mu.Unlock()
+		}
+
+		ticker.Stop()
 
 		// polling
 		if !higherNodeIsAlive {
 			sendWinBroadcast(errorChannel)
 		}
+	case Ack:
+		fmt.Printf(" == Received ack from %d\n", recv.SenderId)
 	default:
-		errorChannel <- fmt.Errorf(" != Invalid message type received from %v: %s", recv.SenderId, recv.Message)
+		errorChannel <- fmt.Errorf(" != Invalid message type received from %v: %s", recv.SenderId, recv.Content)
 		return
 	}
 }
 
-func BroadcastElection(errorChannel chan error) {
+func BroadcastElection(errorChannel chan error, justLaunched bool) {
 	fmt.Println(" == Sending ELECT Broadcast...")
 	// verificam daca nu mai exista vreun nod mai mare in viata
 	// si atunci nodul curent este cel mai mare, acesta trimite win
 	node.Mu.Lock()
-	if !higherNodeIsAlive {
+	if !justLaunched && !higherNodeIsAlive {
 		sendWinBroadcast(errorChannel)
 		node.Mu.Unlock()
 		return
 	}
+	node.Mu.Unlock()
 
 	// blocam citirea si scrierea variabilei electionAlreadySentHigher
 	// pentru a evita o conditie de cursa
@@ -202,12 +238,13 @@ func BroadcastElection(errorChannel chan error) {
 		electionAlreadySentHigher = true
 		node.Mu.Unlock()
 	} else {
+		node.Mu.Unlock()
 		return
 	}
 
 	// deschide cate o conexiune cu fiecare nod mai mare si le trimite
 	// un mesaj de electie
-	for id, ip := range node.idToIpMap {
+	for id, ip := range node.idToAddress {
 		if id > node.currentId {
 			con, err := net.Dial("tcp", ip)
 
@@ -216,7 +253,7 @@ func BroadcastElection(errorChannel chan error) {
 				continue
 			}
 
-			if err = startElectionToConnection(con); err != nil {
+			if err = startElectionToConnection(con, id); err != nil {
 				errorChannel <- fmt.Errorf(" != Could not send election to %v: %w", id, err)
 				continue
 			}
@@ -247,6 +284,7 @@ func BroadcastElection(errorChannel chan error) {
 		node.Mu.Lock()
 		if higherNodeIsAlive {
 			ticker.Stop()
+			node.Mu.Unlock()
 			break
 		}
 		node.Mu.Unlock()
@@ -261,16 +299,18 @@ func BroadcastElection(errorChannel chan error) {
 	node.Mu.Unlock()
 }
 
-func StartServer(address string, waitGroup sync.WaitGroup, errChannel chan error) {
+func StartServer(address string, waitGroup *sync.WaitGroup, statusChannel chan bool, errChannel chan error) {
 	defer waitGroup.Done()
 	fmt.Println("Starting Server on address ", address)
 	listener, err := net.Listen("tcp", address)
 
 	if err != nil {
-		errChannel <- fmt.Errorf(" != Couldn't not listen to incoming connections: %w", err)
+		errChannel <- fmt.Errorf(" != Could not start the server: %w", err)
+		statusChannel <- false
 		return
 	}
 
+	statusChannel <- true
 	defer listener.Close()
 
 	for {
@@ -285,46 +325,77 @@ func StartServer(address string, waitGroup sync.WaitGroup, errChannel chan error
 	}
 }
 
-func StartClient(waitGroup sync.WaitGroup, errorChannel chan error) {
-	defer waitGroup.Done()
+func StartClient(clientServerGroup *sync.WaitGroup, errorChannel chan error) {
+	defer clientServerGroup.Done()
 	maxNodes := viper.GetInt("maxNodes")
-
-	visited := make(map[int]int)
-	for i := 1; i <= maxNodes; i++ {
-		visited[i] = 0
-	}
 
 	fmt.Println("Insert id number from 1 to ", maxNodes)
 	var clientID int
 
-	ok := 0
-	for ok == 0 {
-		fmt.Scanf("%d", &clientID)
-		fmt.Printf("Client-Id: %d\n", clientID)
-		if visited[clientID] == 1 {
-			fmt.Println("This node ID is already taken!")
-		} else {
-			ok = 1
-			visited[clientID] = 1
-		}
-	}
+	fmt.Scanf("%d", &clientID)
+	fmt.Printf("Client-Id: %d\n", clientID)
 
-	nodeIP := "127.0.0.1:" + fmt.Sprint(viper.GetInt("ipPort")+clientID-1)
-	fmt.Println("My IP is: ", nodeIP)
-	address := "127.0.0.1:" + fmt.Sprint(viper.GetInt("maxNodes")+viper.GetInt("ipPort")-1)
-	con, err := net.Dial("tcp", address)
+	node.currentId = clientID
+	nodeIP := "127.0.0.1:" + fmt.Sprint(viper.GetInt("ipPort")+node.currentId-1)
+
+	// Primeste status de la server daca s-a pornit cu succes
+	statusChannel := make(chan bool, 1)
 
 	// Lanseaza server-ul
-	//go StartServer(nodeIP, waitGroup, errorChannel)
+	go StartServer(nodeIP, clientServerGroup, statusChannel, errorChannel)
 
-	if err != nil {
-		errorChannel <- fmt.Errorf(" != Could not connect to %s: %w", address, err)
-	} else {
-		defer con.Close()
+	// Verifica statusul serverului
+	if !<-statusChannel {
+		clientServerGroup.Done()
+		return
 	}
 
+	fmt.Println("My IP is: ", nodeIP)
 	fmt.Println("Log: Invoking Elections")
-	BroadcastElection(errorChannel)
+	BroadcastElection(errorChannel, true)
+
+	for {
+		fmt.Printf("Press enter for %d to communicate with coordinator %d.\n", node.currentId, node.leaderId)
+
+		if _, err := fmt.Scanln(); err != nil {
+			errorChannel <- fmt.Errorf(" != Could not get message from cmd: %w", err)
+			continue
+		}
+
+		if node.leaderId == node.currentId {
+			fmt.Printf(" == I am the current coordinator (%d)\n", node.currentId)
+			continue
+		}
+
+		dialer := net.Dialer{Timeout: time.Duration(viper.GetInt("timeout")) * time.Millisecond}
+		leaderConnection, err := dialer.Dial("tcp", node.idToAddress[node.leaderId])
+
+		if err == nil {
+			msg := Message{
+				SenderId: node.currentId,
+
+				Content: Ack,
+			}
+
+			serial, err := json.Marshal(msg)
+
+			if err != nil {
+				errorChannel <- fmt.Errorf(" != Could not serialize ACK message: %w", err)
+			}
+
+			_, err = fmt.Fprintf(leaderConnection, "%s\n", serial)
+
+			if err != nil {
+				errorChannel <- fmt.Errorf(" != Failed to send ACK message: %w", err)
+			}
+
+			_ = leaderConnection.Close()
+			continue
+		}
+
+		errorChannel <- fmt.Errorf(" != Could not contact the coordinator (%d): %w", node.leaderId, err)
+		BroadcastElection(errorChannel, false)
+	}
 }
 
 func SetupConfig() {
@@ -342,22 +413,32 @@ func SetupConfig() {
 	})
 
 	viper.WatchConfig()
+
+	// Initializeaza mapa id-address
+	port := viper.GetInt("ipPort")
+	node.idToAddress = make(map[int]string)
+	for i := 1; i != viper.GetInt("maxNodes")+1; i++ {
+		node.idToAddress[i] = fmt.Sprintf("127.0.0.1:%d", port+i-1)
+	}
 }
 
 func main() {
+	// Afiseaza PID-ul local
+	fmt.Println("PID: ", os.Getpid())
+
 	// Un nod comunica atat ca si client cat si ca server
 	errChannel := make(chan error, 1)
-	var waitGroup sync.WaitGroup
+	var clientServerGroup sync.WaitGroup
 
 	// Inchide conexiunea dupa ce s-a terminat rutina principala
 	// Si s-au finalizat rutinele go lansate
-	waitGroup.Add(2)
+	clientServerGroup.Add(2)
 
 	// Fa configuratia initiala
 	SetupConfig()
 
 	// Lanseaza clientul
-	go StartClient(waitGroup, errChannel)
+	go StartClient(&clientServerGroup, errChannel)
 
 	// Asculta pe canalul cu erori
 	for err := range errChannel {
@@ -365,5 +446,5 @@ func main() {
 	}
 
 	// Asteapta ca ambele fire de executie sa se incheie (client & server)
-	waitGroup.Wait()
+	clientServerGroup.Wait()
 }
