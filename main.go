@@ -31,22 +31,24 @@ type BullyNode struct {
 	currentId   int
 	leaderId    int
 	idToAddress map[int]string
-	Mu          sync.Mutex
 }
 
 var node = BullyNode{}
 
 // variabila care ne spune daca nodul curent a dat deja mai departe un mesaj de electie
 var electionAlreadySentHigher = false
+var electionAlreadySentHigherMu = sync.Mutex{}
 
 // variabila care ne spune daca nodul curent stie ca altul mai mare este in viata
 var higherNodeIsAlive = false
+var higherNodeIsAliveMu = sync.Mutex{}
 
 // variabila care ne spune daca a primit mesaj de win
 var hasReceivedWin = false
+var hasReceivedWinMu = sync.Mutex{}
 
-func sendMessage(connection net.Conn, message Message) error {
-	fmt.Printf(" == Sending %s to: %d\n", message.Content, message.SenderId)
+func sendMessageTo(connection net.Conn, message Message, toId int) error {
+	fmt.Printf(" == Sending %s to: %d\n", message.Content, toId)
 
 	messageInBytes, err := json.Marshal(&message)
 
@@ -55,7 +57,7 @@ func sendMessage(connection net.Conn, message Message) error {
 	}
 
 	if _, err = fmt.Fprintf(connection, "%s\n", messageInBytes); err != nil {
-		return fmt.Errorf(" != Could not send %s message to %d: %w", message.Content, message.SenderId, err)
+		return fmt.Errorf(" != Could not send %s message to %d: %w", message.Content, toId, err)
 	}
 
 	return nil
@@ -67,6 +69,10 @@ func ReceiveCoordinatorMessage(message Message) {
 	fmt.Println(" == Received WIN from: ", message.SenderId)
 
 	node.leaderId = message.SenderId
+
+	hasReceivedWinMu.Lock()
+	hasReceivedWin = true
+	hasReceivedWinMu.Unlock()
 }
 
 func sendWinBroadcast(errorChannel chan error) {
@@ -82,7 +88,7 @@ func sendWinBroadcast(errorChannel chan error) {
 				continue
 			}
 
-			if err = sendMessage(con, Message{Win, id}); err != nil {
+			if err = sendMessageTo(con, Message{Win, node.currentId}, id); err != nil {
 				errorChannel <- fmt.Errorf(" != Could not send election to %v: %w", id, err)
 				continue
 			}
@@ -105,7 +111,7 @@ func handleRequest(conn net.Conn, errorChannel chan error) {
 		return
 	}
 
-	fmt.Println(" == Content received from ", message.SenderId)
+	fmt.Printf(" == Content %s received from %d\n", message.Content, message.SenderId)
 	handleReceivedMessage(conn, message, errorChannel)
 }
 
@@ -121,10 +127,17 @@ func handleReceivedMessage(
 		if recv.SenderId >= node.currentId {
 			log.Fatalf(" != A smaller node cannot receive election messages from higher nodes")
 		}
+
 		// trimite mesaj alive nodului mai mic care incearca electia
-		if err := sendMessage(conn, recv); err != nil {
+		if err := sendMessageTo(conn, Message{Alive, node.currentId}, recv.SenderId); err != nil {
 			errorChannel <- fmt.Errorf(" != Could not respond to smaller node: %v: %w", recv.SenderId, err)
 		}
+
+		electionAlreadySentHigherMu.Lock()
+		if !electionAlreadySentHigher {
+			BroadcastElection(errorChannel, false)
+		}
+		electionAlreadySentHigherMu.Unlock()
 	case Win:
 		// a fost ales un nou coordonator/lider care este marcat
 		ReceiveCoordinatorMessage(recv)
@@ -132,6 +145,10 @@ func handleReceivedMessage(
 		// asteapta o vreme win-ul.
 		// daca nu primeste, incepe el electia
 		fmt.Printf(" == Wait for WIN message\n")
+
+		higherNodeIsAliveMu.Lock()
+		higherNodeIsAlive = true
+		higherNodeIsAliveMu.Unlock()
 
 		now := time.Now()
 		pollInterval := time.Duration(viper.GetInt("pollInterval")) * time.Millisecond
@@ -143,24 +160,32 @@ func handleReceivedMessage(
 			fmt.Printf(" == Current elapsed: %v\n", timeElapsed)
 			if timeElapsed > time.Duration(viper.GetInt("timeout"))*time.Millisecond {
 				fmt.Printf(" == No one answered\n")
+				hasReceivedWinMu.Lock()
+				hasReceivedWin = false
+				hasReceivedWinMu.Unlock()
 				break
 			}
 
-			node.Mu.Lock()
-			if higherNodeIsAlive {
+			hasReceivedWinMu.Lock()
+			if hasReceivedWin {
 				ticker.Stop()
-				node.Mu.Unlock()
+				hasReceivedWinMu.Unlock()
 				break
 			}
-			node.Mu.Unlock()
+			hasReceivedWinMu.Unlock()
 		}
-
 		ticker.Stop()
 
-		// polling
-		if !higherNodeIsAlive {
-			sendWinBroadcast(errorChannel)
+		// daca nu am primit win, inseamna ca exista noduri mai mari in viata, dar mesajul s-a pierdut
+		// prin urmare, refacem broadcast election
+		hasReceivedWinMu.Lock()
+		if !hasReceivedWin {
+			higherNodeIsAliveMu.Lock()
+			higherNodeIsAlive = true
+			higherNodeIsAliveMu.Unlock()
+			BroadcastElection(errorChannel, false)
 		}
+		hasReceivedWinMu.Unlock()
 	case Ack:
 		fmt.Printf(" == Received ack from %d\n", recv.SenderId)
 	default:
@@ -173,22 +198,22 @@ func BroadcastElection(errorChannel chan error, justLaunched bool) {
 	fmt.Println(" == Sending ELECT Broadcast...")
 	// verificam daca nu mai exista vreun nod mai mare in viata
 	// si atunci nodul curent este cel mai mare, acesta trimite win
-	node.Mu.Lock()
+	higherNodeIsAliveMu.Lock()
 	if !justLaunched && !higherNodeIsAlive {
 		sendWinBroadcast(errorChannel)
-		node.Mu.Unlock()
+		higherNodeIsAliveMu.Unlock()
 		return
 	}
-	node.Mu.Unlock()
+	higherNodeIsAliveMu.Unlock()
 
 	// blocam citirea si scrierea variabilei electionAlreadySentHigher
 	// pentru a evita o conditie de cursa
-	node.Mu.Lock()
+	electionAlreadySentHigherMu.Lock()
 	if !electionAlreadySentHigher {
 		electionAlreadySentHigher = true
-		node.Mu.Unlock()
+		electionAlreadySentHigherMu.Unlock()
 	} else {
-		node.Mu.Unlock()
+		electionAlreadySentHigherMu.Unlock()
 		return
 	}
 
@@ -203,7 +228,7 @@ func BroadcastElection(errorChannel chan error, justLaunched bool) {
 				continue
 			}
 
-			if err = sendMessage(con, Message{Election, id}); err != nil {
+			if err = sendMessageTo(con, Message{Election, node.currentId}, id); err != nil {
 				errorChannel <- fmt.Errorf(" != Could not send election to %v: %w", id, err)
 				continue
 			}
@@ -212,9 +237,9 @@ func BroadcastElection(errorChannel chan error, justLaunched bool) {
 
 	// ne asiguram ca variabila electionAlreadySentHigher
 	// este actualizata dupa ce se trimit toate mesajele de electie
-	node.Mu.Lock()
+	electionAlreadySentHigherMu.Lock()
 	electionAlreadySentHigher = false
-	node.Mu.Unlock()
+	electionAlreadySentHigherMu.Unlock()
 
 	fmt.Printf(" == Wait for ALIVE messages\n")
 	now := time.Now()
@@ -231,22 +256,22 @@ func BroadcastElection(errorChannel chan error, justLaunched bool) {
 			break
 		}
 
-		node.Mu.Lock()
+		higherNodeIsAliveMu.Lock()
 		if higherNodeIsAlive {
 			ticker.Stop()
-			node.Mu.Unlock()
+			higherNodeIsAliveMu.Unlock()
 			break
 		}
-		node.Mu.Unlock()
+		higherNodeIsAliveMu.Unlock()
 	}
 
 	ticker.Stop()
 
-	node.Mu.Lock()
+	higherNodeIsAliveMu.Lock()
 	if !higherNodeIsAlive {
 		sendWinBroadcast(errorChannel)
 	}
-	node.Mu.Unlock()
+	higherNodeIsAliveMu.Unlock()
 }
 
 func StartServer(address string, waitGroup *sync.WaitGroup, statusChannel chan bool, errChannel chan error) {
@@ -276,7 +301,6 @@ func StartServer(address string, waitGroup *sync.WaitGroup, statusChannel chan b
 }
 
 func StartClient(clientServerGroup *sync.WaitGroup, errorChannel chan error) {
-	defer clientServerGroup.Done()
 	maxNodes := viper.GetInt("maxNodes")
 
 	fmt.Println("Insert id number from 1 to ", maxNodes)
@@ -298,6 +322,8 @@ func StartClient(clientServerGroup *sync.WaitGroup, errorChannel chan error) {
 	if !<-statusChannel {
 		clientServerGroup.Done()
 		return
+	} else {
+		defer clientServerGroup.Done()
 	}
 
 	fmt.Println("My IP is: ", nodeIP)
