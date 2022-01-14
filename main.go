@@ -45,68 +45,18 @@ var higherNodeIsAlive = false
 // variabila care ne spune daca a primit mesaj de win
 var hasReceivedWin = false
 
-// functie apelata atunci cand un nod de rang mai mic trimite mesaj de electie catre nodul curent
-func respondToSmallerNode(connection net.Conn, message Message) error {
-	fmt.Println(" == Sending OK to: ", message.SenderId)
+func sendMessage(connection net.Conn, message Message) error {
+	fmt.Printf(" == Sending %s to: %d\n", message.Content, message.SenderId)
 
-	var messageObj = Message{
-		SenderId: node.currentId,
-		Content:  Alive,
-	}
-
-	messageInBytes, err := json.Marshal(&messageObj)
+	messageInBytes, err := json.Marshal(&message)
 
 	if err != nil {
 		return err
 	}
 
 	if _, err = fmt.Fprintf(connection, "%s\n", messageInBytes); err != nil {
-		return fmt.Errorf(" != Could not send ALIVE message to %d: %w", message.SenderId, err)
+		return fmt.Errorf(" != Could not send %s message to %d: %w", message.Content, message.SenderId, err)
 	}
-
-	return nil
-
-}
-
-// functie apelata atunci cand dorim sa trimitem mesajul de electie catre un nod de rang mai mare
-func startElectionToConnection(connection net.Conn, sendToId int) error {
-
-	fmt.Println(" == Sending ELECTION to: ", sendToId)
-
-	messageObj := Message{
-		Content:  "ELECTION",
-		SenderId: node.currentId,
-	}
-
-	messageInBytes, err := json.Marshal(&messageObj)
-
-	if err != nil {
-		return err
-	}
-
-	fmt.Fprintf(connection, "%s\n", string(messageInBytes))
-	return nil
-}
-
-// functie apelata atunci cand nodul curent vrea sa transmita ca el este noul lider
-func sendCoordinatorMessage(connection net.Conn, sendToId int) error {
-
-	fmt.Println(" == Sending WIN to: ", sendToId)
-
-	messageObj := Message{
-		Content:  "WIN",
-		SenderId: node.currentId,
-	}
-
-	messageInBytes, err := json.Marshal(&messageObj)
-
-	if err != nil {
-		return err
-	}
-
-	fmt.Fprintf(connection, "%s\n", string(messageInBytes))
-
-	connection.Close()
 
 	return nil
 }
@@ -132,7 +82,7 @@ func sendWinBroadcast(errorChannel chan error) {
 				continue
 			}
 
-			if err = sendCoordinatorMessage(con, id); err != nil {
+			if err = sendMessage(con, Message{Win, id}); err != nil {
 				errorChannel <- fmt.Errorf(" != Could not send election to %v: %w", id, err)
 				continue
 			}
@@ -172,7 +122,7 @@ func handleReceivedMessage(
 			log.Fatalf(" != A smaller node cannot receive election messages from higher nodes")
 		}
 		// trimite mesaj alive nodului mai mic care incearca electia
-		if err := respondToSmallerNode(conn, recv); err != nil {
+		if err := sendMessage(conn, recv); err != nil {
 			errorChannel <- fmt.Errorf(" != Could not respond to smaller node: %v: %w", recv.SenderId, err)
 		}
 	case Win:
@@ -253,7 +203,7 @@ func BroadcastElection(errorChannel chan error, justLaunched bool) {
 				continue
 			}
 
-			if err = startElectionToConnection(con, id); err != nil {
+			if err = sendMessage(con, Message{Election, id}); err != nil {
 				errorChannel <- fmt.Errorf(" != Could not send election to %v: %w", id, err)
 				continue
 			}
