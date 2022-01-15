@@ -18,7 +18,7 @@ type MessageType string
 const (
 	Election MessageType = "ELECTION"
 	Win      MessageType = "WIN"
-	Alive    MessageType = "OK"
+	Alive    MessageType = "ALIVE"
 	Ack      MessageType = "ACK"
 )
 
@@ -112,13 +112,12 @@ func handleRequest(conn net.Conn, errorChannel chan error) {
 	}
 
 	fmt.Printf(" == Content %s received from %d\n", message.Content, message.SenderId)
-	handleReceivedMessage(conn, message, errorChannel)
+	handleReceivedMessage(message, errorChannel)
 }
 
 // Executa o actiune in functie de tipul mesajului pe care la primiti
 // Precum si luand in considerare id-ul sender-ului
 func handleReceivedMessage(
-	conn net.Conn,
 	recv Message,
 	errorChannel chan error,
 ) {
@@ -128,8 +127,16 @@ func handleReceivedMessage(
 			log.Fatalf(" != A smaller node cannot receive election messages from higher nodes")
 		}
 
+		aliveCon, err := net.Dial("tcp", node.idToAddress[recv.SenderId])
+
+		if err != nil {
+			errorChannel <- fmt.Errorf(" != Could not connect to smaller node %d: %w", recv.SenderId, err)
+		}
+
+		defer aliveCon.Close()
+
 		// trimite mesaj alive nodului mai mic care incearca electia
-		if err := sendMessageTo(conn, Message{Alive, node.currentId}, recv.SenderId); err != nil {
+		if err := sendMessageTo(aliveCon, Message{Alive, node.currentId}, recv.SenderId); err != nil {
 			errorChannel <- fmt.Errorf(" != Could not respond to smaller node: %v: %w", recv.SenderId, err)
 		}
 
@@ -232,6 +239,8 @@ func BroadcastElection(errorChannel chan error, justLaunched bool) {
 				errorChannel <- fmt.Errorf(" != Could not send election to %v: %w", id, err)
 				continue
 			}
+
+			_ = con.Close()
 		}
 	}
 
@@ -304,9 +313,20 @@ func StartClient(clientServerGroup *sync.WaitGroup, errorChannel chan error) {
 	maxNodes := viper.GetInt("maxNodes")
 
 	fmt.Println("Insert id number from 1 to ", maxNodes)
-	var clientID int
 
-	fmt.Scanf("%d", &clientID)
+	var clientID int
+	for status := false; !status; {
+		if _, err := fmt.Scanf("%d", &clientID); err != nil {
+			continue
+		}
+
+		if clientID < 1 || clientID > viper.GetInt("maxNodes") {
+			errorChannel <- fmt.Errorf(" != Invalid client id")
+		} else {
+			status = true
+		}
+	}
+
 	fmt.Printf("Client-Id: %d\n", clientID)
 
 	node.currentId = clientID
