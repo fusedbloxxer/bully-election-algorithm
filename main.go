@@ -23,7 +23,7 @@ const (
 )
 
 type Message struct {
-	Content  MessageType `json:"Content"`
+	Type     MessageType `json:"Type"`
 	SenderId int         `json:"SenderId"`
 }
 
@@ -48,7 +48,7 @@ var hasReceivedWin = false
 var hasReceivedWinMu = sync.Mutex{}
 
 func sendMessageTo(connection net.Conn, message Message, toId int) error {
-	fmt.Printf(" == Sending %s to: %d\n", message.Content, toId)
+	fmt.Printf(" == Sending %s to: %d\n", message.Type, toId)
 
 	messageInBytes, err := json.Marshal(&message)
 
@@ -57,7 +57,7 @@ func sendMessageTo(connection net.Conn, message Message, toId int) error {
 	}
 
 	if _, err = fmt.Fprintf(connection, "%s\n", messageInBytes); err != nil {
-		return fmt.Errorf(" != Could not send %s message to %d: %w", message.Content, toId, err)
+		return fmt.Errorf(" != Could not send %s message to %d: %w", message.Type, toId, err)
 	}
 
 	return nil
@@ -111,17 +111,18 @@ func handleRequest(conn net.Conn, errorChannel chan error) {
 		return
 	}
 
-	fmt.Printf(" == Content %s received from %d\n", message.Content, message.SenderId)
+	fmt.Printf(" == Type %s received from %d\n", message.Type, message.SenderId)
 	handleReceivedMessage(message, errorChannel)
 }
 
-// Executa o actiune in functie de tipul mesajului pe care la primiti
-// Precum si luand in considerare id-ul sender-ului
+// <----- A
+// Executa o actiune in functie de tipul mesajului pe care la primit
+// Ia in considerare id-ul sender-ului
 func handleReceivedMessage(
 	recv Message,
 	errorChannel chan error,
 ) {
-	switch recv.Content {
+	switch recv.Type {
 	case Election:
 		if recv.SenderId >= node.currentId {
 			log.Fatalf(" != A smaller node cannot receive election messages from higher nodes")
@@ -196,7 +197,7 @@ func handleReceivedMessage(
 	case Ack:
 		fmt.Printf(" == Received ack from %d\n", recv.SenderId)
 	default:
-		errorChannel <- fmt.Errorf(" != Invalid message type received from %v: %s", recv.SenderId, recv.Content)
+		errorChannel <- fmt.Errorf(" != Invalid message type received from %v: %s", recv.SenderId, recv.Type)
 		return
 	}
 }
@@ -309,6 +310,8 @@ func StartServer(address string, waitGroup *sync.WaitGroup, statusChannel chan b
 	}
 }
 
+// <--- A
+
 func StartClient(clientServerGroup *sync.WaitGroup, errorChannel chan error) {
 	maxNodes := viper.GetInt("maxNodes")
 
@@ -370,7 +373,7 @@ func StartClient(clientServerGroup *sync.WaitGroup, errorChannel chan error) {
 			msg := Message{
 				SenderId: node.currentId,
 
-				Content: Ack,
+				Type: Ack,
 			}
 
 			serial, err := json.Marshal(msg)
